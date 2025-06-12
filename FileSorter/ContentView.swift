@@ -13,6 +13,13 @@ import Combine
 
 // MARK: - File tree
 
+struct FileSortAction: Codable, Equatable {
+    let action: String
+    let name: String?
+    let source: String?
+    let destination: String?
+}
+
 final class FileNode: Identifiable {
     let id = UUID()
     let name: String
@@ -35,6 +42,25 @@ final class FileNode: Identifiable {
     }
 }
 
+func buildFileTreeSummary(from node: FileNode) -> String {
+    var result = node.name + "/" + "\n" // root folder name with trailing slash
+    func recurse(_ fileNode: FileNode, _ indentLevel: Int) {
+        let indent = String(repeating: "    ", count: indentLevel) // 4 spaces per indent level
+        for child in fileNode.children {
+            if child.isDirectory {
+                // Mark directories with a trailing slash
+                result += indent + child.name + "/\n"
+                recurse(child, indentLevel + 1) // recursive call to handle subfolder contents
+            } else {
+                // List files with their name (extension included)
+                result += indent + child.name + "\n"
+            }
+        }
+    }
+    recurse(node, 1)
+    return result
+}
+
 // MARK: - View‑model
 
 @MainActor
@@ -43,8 +69,11 @@ final class LLMViewModel: ObservableObject {
     @Published var response: String = ""
     @Published var isBusy = false
     @Published var errorMessage: String?
+    @Published var moveProgress: String? = nil
+    @Published var statusMessage: String? = nil
     
-    private var session: LanguageModelSession
+    var session: LanguageModelSession
+    let generationOptions = GenerationOptions(maximumResponseTokens: 4096)
     
     init() {
         // You can pass `instructions:` here if you want a system prompt.
@@ -57,8 +86,21 @@ final class LLMViewModel: ObservableObject {
                 isBusy = true
                 defer { isBusy = false }
                 
-                let reply = try await session.respond(to: prompt)
-                response = reply.content
+                // Use schema-guided generation if prompt suggests a plan or actions
+                if prompt.localizedCaseInsensitiveContains("plan") || prompt.localizedCaseInsensitiveContains("action") {
+                    // Request structured response as an array of FileSortAction
+                    let actions = try await session.respond(
+                        to: prompt,
+                        options: generationOptions
+                    )
+                    DispatchQueue.main.async {
+                        self.response = "Received response: \(actions.content)"
+                    }
+                    // You can handle `actions` as needed here or expose them to UI
+                } else {
+                    let reply = try await session.respond(to: prompt, options: generationOptions)
+                    response = reply.content
+                }
             } catch LanguageModelSession.GenerationError.exceededContextWindowSize {
                 // Fresh session, keep only the last meaningful exchange.
                 let instructions = session.transcript.entries.first
@@ -69,6 +111,118 @@ final class LLMViewModel: ObservableObject {
                 send(prompt)                                  // retry once
             } catch {
                 self.errorMessage = error.localizedDescription
+            }
+        }
+    }
+    
+    /*
+    // Old parseSortingPlan method commented out as schema-guided is now used.
+    func parseSortingPlan(from response: String) -> [[String: String]]? {
+        // Extract JSON array from the response (it might have extra text)
+        guard let jsonStart = response.firstIndex(of: "["),
+              let jsonEnd = response.lastIndex(of: "]") else {
+            print("No JSON array found in response")
+            return nil
+        }
+        
+        let jsonString = String(response[jsonStart...jsonEnd])
+        guard let jsonData = jsonString.data(using: .utf8) else { return nil }
+        
+        do {
+            let actions = try JSONSerialization.jsonObject(with: jsonData) as? [[String: Any]]
+            // Convert to string dictionary for easier handling
+            return actions?.compactMap { dict in
+                var stringDict: [String: String] = [:]
+                for (key, value) in dict {
+                    if let stringValue = value as? String {
+                        stringDict[key] = stringValue
+                    }
+                }
+                return stringDict.isEmpty ? nil : stringDict
+            }
+        } catch {
+            print("JSON parsing error: \(error)")
+            return nil
+        }
+    }
+    */
+    
+    func parseFolderPlan(from text: String) -> [String: [String]] {
+        // Heuristic: Each line mentioning a folder and file types
+        // e.g. "Create an 'Images' folder and move all PNG, JPG..."
+        // Regex for folder name and file types/extensions
+        var result: [String: [String]] = [:]
+        let lines = text.split(separator: "\n").map(String.init)
+        let folderPattern = try! NSRegularExpression(pattern: "(?:create|Create|add|Add)[^']*'([^']+)' folder.*?(move|Move)?[\\w\\s]*((?:\\*\\.[a-zA-Z0-9]+|\\.[a-zA-Z0-9]+|[A-Z]+ files?)(?:,? ?[A-Z]+ files?)*)", options: [])
+        for line in lines {
+            let nsline = line as NSString
+            let matches = folderPattern.matches(in: line, options: [], range: NSRange(location: 0, length: nsline.length))
+            for match in matches {
+                if match.numberOfRanges >= 3 {
+                    let folderName = nsline.substring(with: match.range(at: 1))
+                    let filePart = match.range(at: 3).location != NSNotFound ? nsline.substring(with: match.range(at: 3)) : ""
+                    // Extract extensions like ".jpg", "*.md", or upper-case file types
+                    let extPattern = try! NSRegularExpression(pattern: "\\.\\w+|\\*\\.\\w+|[A-Z]{2,4}", options: [])
+                    let extMatches = extPattern.matches(in: filePart, options: [], range: NSRange(location: 0, length: (filePart as NSString).length))
+                    let exts = extMatches.map { (filePart as NSString).substring(with: $0.range) }
+                    if !folderName.isEmpty && !exts.isEmpty {
+                        result[folderName] = exts
+                    }
+                }
+            }
+        }
+        return result
+    }
+    
+    func pacedMoveFiles(plan: [String: [String]], in rootURL: URL) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let fileManager = FileManager.default
+            var movedCount = 0
+            var errorCount = 0
+            var createdFolders = Set<String>()
+            do {
+                let files = try fileManager.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+                for (folder, patterns) in plan {
+                    let folderURL = rootURL.appendingPathComponent(folder)
+                    if !fileManager.fileExists(atPath: folderURL.path) {
+                        try? fileManager.createDirectory(at: folderURL, withIntermediateDirectories: false)
+                        createdFolders.insert(folder)
+                        DispatchQueue.main.async {
+                            self.moveProgress = "Created folder: \(folder)"
+                        }
+                        Thread.sleep(forTimeInterval: 0.3)
+                    }
+                    for fileURL in files {
+                        let fileName = fileURL.lastPathComponent
+                        let ext = fileURL.pathExtension.uppercased()
+                        let matches = patterns.contains { pat in
+                            if pat.hasPrefix(".*") { return fileName.lowercased().hasSuffix(pat.dropFirst(2).lowercased()) }
+                            if pat.hasPrefix(".") { return "." + ext.lowercased() == pat.lowercased() }
+                            return ext == pat.uppercased() || fileName.uppercased().contains(pat.uppercased())
+                        }
+                        guard matches else { continue }
+                        let destURL = folderURL.appendingPathComponent(fileName)
+                        do {
+                            try fileManager.moveItem(at: fileURL, to: destURL)
+                            movedCount += 1
+                            DispatchQueue.main.async {
+                                self.moveProgress = "Moved \(fileName) to \(folder)/"
+                            }
+                        } catch {
+                            errorCount += 1
+                        }
+                        Thread.sleep(forTimeInterval: 0.3)
+                    }
+                }
+                DispatchQueue.main.async {
+                    self.moveProgress = "Completed: \(movedCount) files moved to \(createdFolders.count) folders, \(errorCount) errors."
+                    self.statusMessage = "Organization complete! Moved \(movedCount) file(s)."
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.moveProgress = "Scan error: \(error.localizedDescription)"
+                    self.statusMessage = "Failed to scan folder."
+                }
             }
         }
     }
@@ -87,7 +241,9 @@ struct ContentView: View {
     }()
     
     @State private var promptText = ""
-    @State private var statusMessage = "No folder selected."
+    @State private var aiPlanText: String = ""
+    @State private var rootFileNode: FileNode? = nil // holds the scanned folder tree
+    @State private var moveProgress: String? = nil
     
     var body: some View {
         VStack(spacing: 20) {
@@ -125,14 +281,41 @@ struct ContentView: View {
             GroupBox("Select a folder to scan") {
                 VStack(spacing: 8) {
                     Button("Choose Folder…", action: openFolderDialog)
-                    Text(statusMessage)
+                    
+                    Button("Sort Files with AI") {
+                        sortFiles()
+                    }
+                    .disabled(rootFileNode == nil)
+                    
+                    Text(llm.statusMessage ?? "No folder selected.")
                         .foregroundColor(.secondary)
                         .italic()
+                    
+                    if let progress = moveProgress ?? llm.moveProgress {
+                        Text(progress).foregroundColor(.blue).font(.callout)
+                    }
+                    
+                    if !aiPlanText.isEmpty {
+                        Text("AI Plan:")
+                            .font(.subheadline).bold()
+                        ScrollView {
+                            Text(aiPlanText)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal)
+                        }
+                        .frame(maxHeight: 200)
+                        .background(Color(NSColor.windowBackgroundColor).opacity(0.2))
+                        .cornerRadius(8)
+                    }
                 }
             }
         }
         .padding()
         .frame(minWidth: 500, minHeight: 600)
+        .onChange(of: llm.moveProgress) { _, newValue in
+            moveProgress = newValue
+        }
     }
 }
 
@@ -180,6 +363,7 @@ extension ContentView {
             }
             
             print("Completed scanning \(rootNode.name). Found \(rootNode.children.count) items at top level.")
+            self.rootFileNode = rootNode   // retain the file tree for later use
         }
     }
     
@@ -187,18 +371,282 @@ extension ContentView {
         let panel = NSOpenPanel()
         panel.title = "Choose Folder"
         panel.prompt = "Select"
-        panel.allowsMultipleSelection = true
+        // Disable multiple selection to reduce system warnings
+        panel.allowsMultipleSelection = false
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         
         if panel.runModal() == .OK {
             Task { @MainActor in
                 let urls = panel.urls
-                statusMessage = urls.isEmpty
-                ? "Selection cancelled."
-                : "Selected \(urls.count) folder\(urls.count > 1 ? "s" : "")."
+                llm.statusMessage = urls.isEmpty
+                    ? "Selection cancelled."
+                    : "Selected a folder."
             }
             panel.urls.forEach(scanFolder(at:))
         }
     }
+    
+    func sortFiles() {
+        guard let root = rootFileNode else { return }
+        let instructionText = """
+You are a file-organizing assistant. Respond only with a JSON array of actions, matching this format:
+[
+  {"action": "create_folder", "name": "Images"},
+  {"action": "move_file", "source": "photo.jpg", "destination": "Images/photo.jpg"}
+]
+Do not include explanations or Markdown formatting.
+"""
+        let fileTreeSummary = buildFileTreeSummary(from: root)
+        let promptText = "Folder structure:\n\(fileTreeSummary)"
+        aiPlanText = "" // clear from previous
+        llm.statusMessage = "Analyzing folder..."
+        Task {
+            do {
+                // Use schema-guided generation to get structured actions for sorting plan
+                let actions = try await llm.session.respond(
+                    to: instructionText + "\n" + promptText,
+                    options: llm.generationOptions
+                )
+                let content = actions.content
+                print("Raw AI output: \(actions.content)")
+                // Attempt to decode the content as [FileSortAction]
+                if let data = content.data(using: .utf8) {
+                    let decoder = JSONDecoder()
+                    if let decodedActions = try? decoder.decode([FileSortAction].self, from: data) {
+                        let planDescription = decodedActions.map {
+                            var desc = "Action: \($0.action)"
+                            if let name = $0.name { desc += ", Name: \(name)" }
+                            if let source = $0.source { desc += ", Source: \(source)" }
+                            if let dest = $0.destination { desc += ", Destination: \(dest)" }
+                            return desc
+                        }.joined(separator: "\n")
+                        DispatchQueue.main.async {
+                            aiPlanText = planDescription
+                        }
+                        if let rootURL = rootFileNode?.url {
+                            executeSortingPlan(decodedActions, rootURL: rootURL)
+                        }
+                    } else {
+                        // Fallback parsing if JSON decoding fails
+                        let plan = llm.parseFolderPlan(from: content)
+                        DispatchQueue.main.async {
+                            aiPlanText = "Fallback plan used: \(plan.description)"
+                        }
+                        if let rootURL = rootFileNode?.url {
+                            llm.pacedMoveFiles(plan: plan, in: rootURL)
+                        }
+                    }
+                } else {
+                    // Fallback parsing if content can't be converted to data
+                    let plan = llm.parseFolderPlan(from: content)
+                    DispatchQueue.main.async {
+                        aiPlanText = "Fallback plan used: \(plan.description)"
+                    }
+                    if let rootURL = rootFileNode?.url {
+                        llm.pacedMoveFiles(plan: plan, in: rootURL)
+                    }
+                }
+            } catch {
+                print("AI generation failed: \(error)")
+                DispatchQueue.main.async {
+                    llm.statusMessage = "AI failed to generate a plan."
+                }
+            }
+        }
+    }
+    
+    // Execute the sorting plan
+    func executeSortingPlan(_ plan: [FileSortAction], rootURL: URL) {
+        let fileManager = FileManager.default
+        var createdFolders = Set<String>()
+        var movedCount = 0
+        var errorCount = 0
+        
+        for action in plan {
+            switch action.action {
+            case "create_folder":
+                if let folderName = action.name {
+                    let folderURL = rootURL.appendingPathComponent(folderName)
+                    if !fileManager.fileExists(atPath: folderURL.path) {
+                        do {
+                            try fileManager.createDirectory(at: folderURL,
+                                                          withIntermediateDirectories: true)
+                            createdFolders.insert(folderName)
+                            print("Created folder: \(folderName)")
+                        } catch {
+                            print("Failed to create folder \(folderName): \(error)")
+                            errorCount += 1
+                        }
+                    }
+                }
+            
+            case "move_file":
+                if let source = action.source,
+                   let destination = action.destination {
+                    let sourceURL = rootURL.appendingPathComponent(source)
+                    let destURL = rootURL.appendingPathComponent(destination)
+                    
+                    // Ensure destination directory exists
+                    let destDir = destURL.deletingLastPathComponent()
+                    try? fileManager.createDirectory(at: destDir,
+                                                   withIntermediateDirectories: true)
+                    
+                    do {
+                        try fileManager.moveItem(at: sourceURL, to: destURL)
+                        movedCount += 1
+                        print("Moved: \(source) → \(destination)")
+                    } catch {
+                        print("Failed to move \(source): \(error)")
+                        errorCount += 1
+                    }
+                }
+            
+            default:
+                print("Unknown action: \(action.action)")
+            }
+        }
+        
+        // Update status
+        var status = "Organization complete! "
+        if movedCount > 0 {
+            status += "Moved \(movedCount) file\(movedCount == 1 ? "" : "s"). "
+        }
+        if createdFolders.count > 0 {
+            status += "Created \(createdFolders.count) folder\(createdFolders.count == 1 ? "" : "s"). "
+        }
+        if errorCount > 0 {
+            status += "\(errorCount) error\(errorCount == 1 ? "" : "s") occurred."
+        }
+        
+        llm.statusMessage = status
+        
+        // Rescan the folder to update the view
+        if movedCount > 0 || createdFolders.count > 0 {
+            scanFolder(at: rootURL)
+        }
+    }
+    
+    func extensionToFolderMapping(plan: String, scannedFiles: [URL]) -> [String: String] {
+        let extKeywords = ["PNG", "JPG", "JPEG", "GIF", "PDF", "DOCX", "DOC", "TXT", "MOV", "MP4", "MP3", "ZIP", "RAR", "M4A"]
+        var extToFolder: [String: String] = [:]
+        let lines = plan.components(separatedBy: "\n")
+        for line in lines {
+            var folderName: String? = nil
+            if let boldStart = line.range(of: "**"), let boldEnd = line[boldStart.upperBound...].range(of: "**") {
+                folderName = String(line[boldStart.upperBound..<boldEnd.lowerBound])
+            } else if let quoteStart = line.range(of: "\""), let quoteEnd = line[quoteStart.upperBound...].range(of: "\"") {
+                folderName = String(line[quoteStart.upperBound..<quoteEnd.lowerBound])
+            } else {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let dotRange = trimmed.range(of: ".") {
+                    let afterDot = trimmed[dotRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let dashIndex = afterDot.firstIndex(where: { $0 == "-" || $0 == "–" }) {
+                        folderName = String(afterDot[..<dashIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    } else {
+                        folderName = String(afterDot)
+                    }
+                }
+            }
+            if let name = folderName {
+                folderName = name.trimmingCharacters(in: CharacterSet(charactersIn: ":–- ").union(.whitespacesAndNewlines))
+            }
+            var foundExts: [String] = []
+            for ext in extKeywords {
+                if line.uppercased().contains(ext) {
+                    foundExts.append(ext.lowercased())
+                }
+            }
+            if let folder = folderName {
+                for ext in foundExts {
+                    extToFolder[ext] = folder
+                }
+            }
+        }
+        return extToFolder
+    }
+    
+    func pacedMoveFilesExtensionMap(extToFolder: [String: String], in rootURL: URL) {
+        let fileManager = FileManager.default
+        DispatchQueue.global(qos: .userInitiated).async {
+            var movedCount = 0
+            var errorCount = 0
+            var createdFolders = Set<String>()
+            do {
+                let files = try fileManager.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+                for fileURL in files {
+                    let ext = fileURL.pathExtension.lowercased()
+                    guard let folder = extToFolder[ext] else { continue }
+                    let folderURL = rootURL.appendingPathComponent(folder)
+                    if !fileManager.fileExists(atPath: folderURL.path) {
+                        try? fileManager.createDirectory(at: folderURL, withIntermediateDirectories: false)
+                        createdFolders.insert(folder)
+                        DispatchQueue.main.async {
+                            self.moveProgress = "Created folder: \(folder)"
+                        }
+                        Thread.sleep(forTimeInterval: 0.3)
+                    }
+                    let destURL = folderURL.appendingPathComponent(fileURL.lastPathComponent)
+                    do {
+                        try fileManager.moveItem(at: fileURL, to: destURL)
+                        movedCount += 1
+                        DispatchQueue.main.async {
+                            self.moveProgress = "Moved \(fileURL.lastPathComponent) to \(folder)/"
+                        }
+                    } catch {
+                        errorCount += 1
+                    }
+                    Thread.sleep(forTimeInterval: 0.3)
+                }
+                DispatchQueue.main.async {
+                    self.moveProgress = "Completed: \(movedCount) files moved to \(createdFolders.count) folders, \(errorCount) errors."
+                    self.llm.statusMessage = "Organization complete! Moved \(movedCount) file(s)."
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.moveProgress = "Scan error: \(error.localizedDescription)"
+                    self.llm.statusMessage = "Failed to scan folder."
+                }
+            }
+        }
+    }
+    
+    func moveFilesByExtension(extToFolder: [String: String], in root: FileNode, rootFolderURL: URL) async {
+        let fileManager = FileManager.default
+        // Create destination folders
+        for folderName in Set(extToFolder.values) {
+            let targetFolderURL = rootFolderURL.appendingPathComponent(folderName)
+            do {
+                try fileManager.createDirectory(at: targetFolderURL, withIntermediateDirectories: true, attributes: nil)
+            } catch {
+                print("Could not create folder \(folderName): \(error)")
+            }
+        }
+        // Recursively move files
+        func moveFiles(in node: FileNode) async {
+            for child in node.children {
+                if child.isDirectory {
+                    await moveFiles(in: child)
+                } else {
+                    let ext = child.url.pathExtension.lowercased()
+                    if let targetFolderName = extToFolder[ext] {
+                        let targetURL = rootFolderURL.appendingPathComponent(targetFolderName).appendingPathComponent(child.name)
+                        do {
+                            try fileManager.moveItem(at: child.url, to: targetURL)
+                            print("Moved \(child.name) to \(targetFolderName)/")
+                            try await Task.sleep(nanoseconds: 500_000_000)
+                        } catch {
+                            print("Failed to move \(child.name): \(error)")
+                        }
+                    }
+                }
+            }
+        }
+        await moveFiles(in: root)
+        // All moves done – update status on main thread
+        DispatchQueue.main.async {
+            self.llm.statusMessage = "Files organized by type successfully!"
+        }
+    }
 }
+
