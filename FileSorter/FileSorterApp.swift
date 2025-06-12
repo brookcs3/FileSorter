@@ -15,7 +15,10 @@ struct FileSorterApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .containerBackground(.ultraThinMaterial, for: .window)
                 .environment(\.managedObjectContext, persistenceController.container.viewContext)
         }
+        .windowStyle(.hiddenTitleBar)
+        .windowBackgroundDragBehavior(.enabled)
     }
 }

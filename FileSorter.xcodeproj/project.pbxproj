@@ -6,6 +6,10 @@
 	objectVersion = 90;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		BA5F7C1F2DFACB80001E107E /* FoundationModels.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BA5F7C1E2DFACB80001E107E /* FoundationModels.framework */; settings = {ATTRIBUTES = (Required, ); }; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		BA2316B62DFAA96F00197761 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -27,6 +31,7 @@
 		BA2316A32DFAA96E00197761 /* FileSorter.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FileSorter.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		BA2316B52DFAA96F00197761 /* FileSorterTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FileSorterTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		BA2316BF2DFAA96F00197761 /* FileSorterUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FileSorterUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		BA5F7C1E2DFACB80001E107E /* FoundationModels.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FoundationModels.framework; path = System/Library/Frameworks/FoundationModels.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -51,6 +56,7 @@
 		BA2316A02DFAA96E00197761 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				BA5F7C1F2DFACB80001E107E /* FoundationModels.framework in Frameworks */,
 			);
 		};
 		BA2316B22DFAA96F00197761 /* Frameworks */ = {
@@ -72,6 +78,7 @@
 				BA2316A52DFAA96E00197761 /* FileSorter */,
 				BA2316B82DFAA96F00197761 /* FileSorterTests */,
 				BA2316C22DFAA96F00197761 /* FileSorterUITests */,
+				BA5F7C1D2DFACB80001E107E /* Frameworks */,
 				BA2316A42DFAA96E00197761 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -84,6 +91,14 @@
 				BA2316BF2DFAA96F00197761 /* FileSorterUITests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		BA5F7C1D2DFACB80001E107E /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				BA5F7C1E2DFACB80001E107E /* FoundationModels.framework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -375,6 +390,7 @@
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_INCOMING_NETWORK_CONNECTIONS = NO;
+				ENABLE_ON_DEMAND_RESOURCES = NO;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = NO;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
@@ -397,7 +413,9 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.cameronbrooks.FileSorter;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
+				SDKROOT = macosx26.0;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = macosx;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
@@ -417,6 +435,7 @@
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_INCOMING_NETWORK_CONNECTIONS = NO;
+				ENABLE_ON_DEMAND_RESOURCES = NO;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = NO;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
@@ -439,7 +458,9 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.cameronbrooks.FileSorter;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
+				SDKROOT = macosx26.0;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = macosx;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
