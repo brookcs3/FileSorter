@@ -390,12 +390,12 @@ extension ContentView {
     func sortFiles() {
         guard let root = rootFileNode else { return }
         let instructionText = """
-You are a file-organizing assistant. Respond only with a JSON array of actions, matching this format:
+Organize the files in the provided folder structure in a clear, logical way, grouping similar files into appropriately-named folders (e.g., any file). Only create new folders if they help with organization. For each folder, move files of matching type or category into it, and do not move files unnecessarily. Respond ONLY with a valid JSON array of actions, each in this format:
 [
-  {"action": "create_folder", "name": "Images"},
-  {"action": "move_file", "source": "photo.jpg", "destination": "Images/photo.jpg"}
+  {"action": "create_folder", "name": "<folder_name_that_describes_contents>"},
+  {"action": "move_file", "source": "<file>.<type>", "destination": "<folder_name_that_describes_contents>/<file>.<type>"}
 ]
-Do not include explanations or Markdown formatting.
+No explanation, no extra text, no markdown.
 """
         let fileTreeSummary = buildFileTreeSummary(from: root)
         let promptText = "Folder structure:\n\(fileTreeSummary)"
@@ -403,54 +403,37 @@ Do not include explanations or Markdown formatting.
         llm.statusMessage = "Analyzing folder..."
         Task {
             do {
-                // Use schema-guided generation to get structured actions for sorting plan
                 let actions = try await llm.session.respond(
                     to: instructionText + "\n" + promptText,
                     options: llm.generationOptions
                 )
                 let content = actions.content
                 print("Raw AI output: \(actions.content)")
-                // Attempt to decode the content as [FileSortAction]
-                if let data = content.data(using: .utf8) {
-                    let decoder = JSONDecoder()
-                    if let decodedActions = try? decoder.decode([FileSortAction].self, from: data) {
-                        let planDescription = decodedActions.map {
-                            var desc = "Action: \($0.action)"
-                            if let name = $0.name { desc += ", Name: \(name)" }
-                            if let source = $0.source { desc += ", Source: \(source)" }
-                            if let dest = $0.destination { desc += ", Destination: \(dest)" }
-                            return desc
-                        }.joined(separator: "\n")
-                        DispatchQueue.main.async {
-                            aiPlanText = planDescription
-                        }
-                        if let rootURL = rootFileNode?.url {
-                            executeSortingPlan(decodedActions, rootURL: rootURL)
-                        }
-                    } else {
-                        // Fallback parsing if JSON decoding fails
-                        let plan = llm.parseFolderPlan(from: content)
-                        DispatchQueue.main.async {
-                            aiPlanText = "Fallback plan used: \(plan.description)"
-                        }
-                        if let rootURL = rootFileNode?.url {
-                            llm.pacedMoveFiles(plan: plan, in: rootURL)
-                        }
-                    }
-                } else {
-                    // Fallback parsing if content can't be converted to data
-                    let plan = llm.parseFolderPlan(from: content)
+                guard let data = content.data(using: .utf8) else {
                     DispatchQueue.main.async {
-                        aiPlanText = "Fallback plan used: \(plan.description)"
+                        llm.statusMessage = "AI did not return valid UTF-8 JSON."
                     }
-                    if let rootURL = rootFileNode?.url {
-                        llm.pacedMoveFiles(plan: plan, in: rootURL)
-                    }
+                    return
+                }
+                let decoder = JSONDecoder()
+                let decodedActions = try decoder.decode([FileSortAction].self, from: data)
+                let planDescription = decodedActions.map {
+                    var desc = "Action: \($0.action)"
+                    if let name = $0.name { desc += ", Name: \(name)" }
+                    if let source = $0.source { desc += ", Source: \(source)" }
+                    if let dest = $0.destination { desc += ", Destination: \(dest)" }
+                    return desc
+                }.joined(separator: "\n")
+                DispatchQueue.main.async {
+                    aiPlanText = planDescription
+                }
+                if let rootURL = rootFileNode?.url {
+                    executeSortingPlan(decodedActions, rootURL: rootURL)
                 }
             } catch {
-                print("AI generation failed: \(error)")
+                print("AI generation or decoding failed: \(error)")
                 DispatchQueue.main.async {
-                    llm.statusMessage = "AI failed to generate a plan."
+                    llm.statusMessage = "AI failed to generate a valid JSON plan: \(error.localizedDescription)"
                 }
             }
         }
@@ -525,45 +508,6 @@ Do not include explanations or Markdown formatting.
         if movedCount > 0 || createdFolders.count > 0 {
             scanFolder(at: rootURL)
         }
-    }
-    
-    func extensionToFolderMapping(plan: String, scannedFiles: [URL]) -> [String: String] {
-        let extKeywords = ["PNG", "JPG", "JPEG", "GIF", "PDF", "DOCX", "DOC", "TXT", "MOV", "MP4", "MP3", "ZIP", "RAR", "M4A"]
-        var extToFolder: [String: String] = [:]
-        let lines = plan.components(separatedBy: "\n")
-        for line in lines {
-            var folderName: String? = nil
-            if let boldStart = line.range(of: "**"), let boldEnd = line[boldStart.upperBound...].range(of: "**") {
-                folderName = String(line[boldStart.upperBound..<boldEnd.lowerBound])
-            } else if let quoteStart = line.range(of: "\""), let quoteEnd = line[quoteStart.upperBound...].range(of: "\"") {
-                folderName = String(line[quoteStart.upperBound..<quoteEnd.lowerBound])
-            } else {
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                if let dotRange = trimmed.range(of: ".") {
-                    let afterDot = trimmed[dotRange.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-                    if let dashIndex = afterDot.firstIndex(where: { $0 == "-" || $0 == "–" }) {
-                        folderName = String(afterDot[..<dashIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    } else {
-                        folderName = String(afterDot)
-                    }
-                }
-            }
-            if let name = folderName {
-                folderName = name.trimmingCharacters(in: CharacterSet(charactersIn: ":–- ").union(.whitespacesAndNewlines))
-            }
-            var foundExts: [String] = []
-            for ext in extKeywords {
-                if line.uppercased().contains(ext) {
-                    foundExts.append(ext.lowercased())
-                }
-            }
-            if let folder = folderName {
-                for ext in foundExts {
-                    extToFolder[ext] = folder
-                }
-            }
-        }
-        return extToFolder
     }
     
     func pacedMoveFilesExtensionMap(extToFolder: [String: String], in rootURL: URL) {
