@@ -504,86 +504,35 @@ No explanation, no extra text, no markdown.
         
         llm.statusMessage = status
         
-        // Rescan the folder to update the view
-        if movedCount > 0 || createdFolders.count > 0 {
-            scanFolder(at: rootURL)
+        while let fileURL = enumerator?.nextObject() as? URL {
+            let parentURL = fileURL.deletingLastPathComponent()
+            guard let parentNode = nodeLookup[parentURL] else { continue }
+            let isDir = (try? fileURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            let node = FileNode(name: fileURL.lastPathComponent, url: fileURL, isDirectory: isDir, parent: parentNode)
+            parentNode.children.append(node)
+            if isDir { nodeLookup[fileURL] = node }
         }
+        return rootNode
+    }
+
+    private func getDirectoriesBottomUp(from root: FileNode) -> [FileNode] {
+        var directories: [FileNode] = []
+        func traverse(_ node: FileNode) {
+            guard node.isDirectory else { return }
+            node.children.forEach { traverse($0) }
+            directories.append(node)
+        }
+        traverse(root)
+        return directories
     }
     
-    func pacedMoveFilesExtensionMap(extToFolder: [String: String], in rootURL: URL) {
-        let fileManager = FileManager.default
-        DispatchQueue.global(qos: .userInitiated).async {
-            var movedCount = 0
-            var errorCount = 0
-            var createdFolders = Set<String>()
-            do {
-                let files = try fileManager.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
-                for fileURL in files {
-                    let ext = fileURL.pathExtension.lowercased()
-                    guard let folder = extToFolder[ext] else { continue }
-                    let folderURL = rootURL.appendingPathComponent(folder)
-                    if !fileManager.fileExists(atPath: folderURL.path) {
-                        try? fileManager.createDirectory(at: folderURL, withIntermediateDirectories: false)
-                        createdFolders.insert(folder)
-                        DispatchQueue.main.async {
-                            self.moveProgress = "Created folder: \(folder)"
-                        }
-                        Thread.sleep(forTimeInterval: 0.3)
-                    }
-                    let destURL = folderURL.appendingPathComponent(fileURL.lastPathComponent)
-                    do {
-                        try fileManager.moveItem(at: fileURL, to: destURL)
-                        movedCount += 1
-                        DispatchQueue.main.async {
-                            self.moveProgress = "Moved \(fileURL.lastPathComponent) to \(folder)/"
-                        }
-                    } catch {
-                        errorCount += 1
-                    }
-                    Thread.sleep(forTimeInterval: 0.3)
-                }
-                DispatchQueue.main.async {
-                    self.moveProgress = "Completed: \(movedCount) files moved to \(createdFolders.count) folders, \(errorCount) errors."
-                    self.llm.statusMessage = "Organization complete! Moved \(movedCount) file(s)."
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.moveProgress = "Scan error: \(error.localizedDescription)"
-                    self.llm.statusMessage = "Failed to scan folder."
-                }
-            }
-        }
-    }
-    
-    func moveFilesByExtension(extToFolder: [String: String], in root: FileNode, rootFolderURL: URL) async {
-        let fileManager = FileManager.default
-        // Create destination folders
-        for folderName in Set(extToFolder.values) {
-            let targetFolderURL = rootFolderURL.appendingPathComponent(folderName)
-            do {
-                try fileManager.createDirectory(at: targetFolderURL, withIntermediateDirectories: true, attributes: nil)
-            } catch {
-                print("Could not create folder \(folderName): \(error)")
-            }
-        }
-        // Recursively move files
-        func moveFiles(in node: FileNode) async {
-            for child in node.children {
-                if child.isDirectory {
-                    await moveFiles(in: child)
-                } else {
-                    let ext = child.url.pathExtension.lowercased()
-                    if let targetFolderName = extToFolder[ext] {
-                        let targetURL = rootFolderURL.appendingPathComponent(targetFolderName).appendingPathComponent(child.name)
-                        do {
-                            try fileManager.moveItem(at: child.url, to: targetURL)
-                            print("Moved \(child.name) to \(targetFolderName)/")
-                            try await Task.sleep(nanoseconds: 500_000_000)
-                        } catch {
-                            print("Failed to move \(child.name): \(error)")
-                        }
-                    }
-                }
+    private func buildTreeSummary(from node: FileNode, level: Int = 0) -> String {
+        var result = String(repeating: "  ", count: level) + node.name + "/\n"
+        for child in node.children {
+            if child.isDirectory {
+                result += buildTreeSummary(from: child, level: level + 1)
+            } else {
+                result += String(repeating: "  ", count: level + 1) + child.name + "\n"
             }
         }
         await moveFiles(in: root)
