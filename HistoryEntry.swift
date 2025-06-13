@@ -1,4 +1,12 @@
 //
+//  HistoryEntry.swift
+//  FileSorter
+//
+//  Created by Cameron Brooks on 6/13/25.
+//
+
+
+//
 //  ContentView.swift
 //  FileSorter
 //

@@ -5,541 +5,771 @@
 //  Created by Cameron Brooks on 6/11/25.
 //
 
-import FoundationModels
 import SwiftUI
 import AppKit
-import CoreData
 import Combine
+import FoundationModels         // macOS 26 SDK
 
-// MARK: - File tree
-
-struct FileSortAction: Codable, Equatable {
-    let action: String
-    let name: String?
-    let source: String?
-    let destination: String?
-}
-
-final class FileNode: Identifiable {
-    let id = UUID()
-    let name: String
-    let url: URL
-    let isDirectory: Bool
-    let size: Int?          // bytes; nil for dirs
-    let modifiedDate: Date?
-    var children: [FileNode] = []
+struct Transcript {
+    enum Entry: Equatable {
+        case user(String)
+        case assistant(String)
+        
+        var text: String {
+            switch self {
+            case .user(let msg): return msg
+            case .assistant(let msg): return msg
+            }
+        }
+    }
     
-    init(name: String,
-         url: URL,
-         isDirectory: Bool,
-         size: Int?,
-         modifiedDate: Date?) {
-        self.name = name
-        self.url = url
-        self.isDirectory = isDirectory
-        self.size = size
-        self.modifiedDate = modifiedDate
+    private(set) var history: [Entry] = []
+    
+    mutating func append(_ entry: Entry) {
+        history.append(entry)
     }
 }
 
-func buildFileTreeSummary(from node: FileNode) -> String {
+/// Splits a large summary string into batches of maxTokensOrChars size (approximation).
+func splitSummaryIntoBatches(_ summary: String, maxTokensOrChars: Int) -> [String] {
+    // Split by lines for easier chunking
+    let lines = summary.components(separatedBy: .newlines)
+    var batches: [String] = []
+    var currentBatch: [String] = []
+    var currentLength = 0
+    for line in lines {
+        let lineLen = line.count + 1 // Include newline char
+        if currentLength + lineLen > maxTokensOrChars, !currentBatch.isEmpty {
+            batches.append(currentBatch.joined(separator: "\n"))
+            currentBatch = []
+            currentLength = 0
+        }
+        currentBatch.append(line)
+        currentLength += lineLen
+    }
+    if !currentBatch.isEmpty {
+        batches.append(currentBatch.joined(separator: "\n"))
+    }
+    return batches
+}
+
+struct FileNode: Equatable, Identifiable {
+    let id = UUID()
+    let name: String
+    let isDirectory: Bool
+    var children: [FileNode] = []
+}
+
+func buildFileTreeSummary(from node: FileNode, maxTokensOrChars: Int) -> [String] {
     var result = node.name + "/" + "\n" // root folder name with trailing slash
     func recurse(_ fileNode: FileNode, _ indentLevel: Int) {
         let indent = String(repeating: "    ", count: indentLevel) // 4 spaces per indent level
         for child in fileNode.children {
             if child.isDirectory {
-                // Mark directories with a trailing slash
                 result += indent + child.name + "/\n"
-                recurse(child, indentLevel + 1) // recursive call to handle subfolder contents
+                recurse(child, indentLevel + 1)
             } else {
-                // List files with their name (extension included)
                 result += indent + child.name + "\n"
             }
         }
     }
     recurse(node, 1)
-    return result
+    return splitSummaryIntoBatches(result, maxTokensOrChars: maxTokensOrChars)
 }
 
-// MARK: - View‑model
+// MARK: - History ----------------------------------------------------------
+
+struct HistoryEntry: Identifiable, Equatable {
+    let id = UUID()
+    let timestamp = Date()
+    let message: String
+}
+
+// MARK: - AI‑Plan Types ----------------------------------------------------
+
+enum SortAction: String, Codable { case create_folder, move_file, rename_folder }
+
+struct FileSortAction: Codable, Equatable {
+    let action: SortAction
+    let source: String
+    let destination: String?
+    let name: String?
+}
+
+// MARK: - View‑Model -------------------------------------------------------
 
 @MainActor
 @available(macOS 26.0, *)
 final class LLMViewModel: ObservableObject {
-    @Published var response: String = ""
     @Published var isBusy = false
-    @Published var errorMessage: String?
-    @Published var moveProgress: String? = nil
-    @Published var statusMessage: String? = nil
-    
-    var session: LanguageModelSession
-    let generationOptions = GenerationOptions(maximumResponseTokens: 4096)
-    
-    init() {
-        // You can pass `instructions:` here if you want a system prompt.
-        self.session = LanguageModelSession()
-    }
-    
-    func send(_ prompt: String) {
-        Task {
-            do {
-                isBusy = true
-                defer { isBusy = false }
-                
-                // Use schema-guided generation if prompt suggests a plan or actions
-                if prompt.localizedCaseInsensitiveContains("plan") || prompt.localizedCaseInsensitiveContains("action") {
-                    // Request structured response as an array of FileSortAction
-                    let actions = try await session.respond(
-                        to: prompt,
-                        options: generationOptions
-                    )
-                    DispatchQueue.main.async {
-                        self.response = "Received response: \(actions.content)"
-                    }
-                    // You can handle `actions` as needed here or expose them to UI
-                } else {
-                    let reply = try await session.respond(to: prompt, options: generationOptions)
-                    response = reply.content
-                }
-            } catch LanguageModelSession.GenerationError.exceededContextWindowSize {
-                // Fresh session, keep only the last meaningful exchange.
-                let instructions = session.transcript.entries.first
-                let last = session.transcript.entries.last
-                let condensed = Transcript(entries: [instructions, last].compactMap { $0 })
-                let newSession = LanguageModelSession(transcript: condensed)
-                self.session = newSession
-                send(prompt)                                  // retry once
-            } catch {
-                self.errorMessage = error.localizedDescription
-            }
+    @Published var statusMessage: String?
+    @Published var transcript = Transcript()
+
+    public var maximumResponseTokens: Int?
+
+    var generationOptions: GenerationOptions {
+        if let maxTokens = maximumResponseTokens {
+            return GenerationOptions(maximumResponseTokens: maxTokens)
+        } else {
+            return GenerationOptions()
         }
     }
-    
-    /*
-    // Old parseSortingPlan method commented out as schema-guided is now used.
-    func parseSortingPlan(from response: String) -> [[String: String]]? {
-        // Extract JSON array from the response (it might have extra text)
-        guard let jsonStart = response.firstIndex(of: "["),
-              let jsonEnd = response.lastIndex(of: "]") else {
-            print("No JSON array found in response")
-            return nil
-        }
-        
-        let jsonString = String(response[jsonStart...jsonEnd])
-        guard let jsonData = jsonString.data(using: .utf8) else { return nil }
-        
-        do {
-            let actions = try JSONSerialization.jsonObject(with: jsonData) as? [[String: Any]]
-            // Convert to string dictionary for easier handling
-            return actions?.compactMap { dict in
-                var stringDict: [String: String] = [:]
-                for (key, value) in dict {
-                    if let stringValue = value as? String {
-                        stringDict[key] = stringValue
-                    }
-                }
-                return stringDict.isEmpty ? nil : stringDict
-            }
-        } catch {
-            print("JSON parsing error: \(error)")
-            return nil
-        }
-    }
-    */
-    
-    func parseFolderPlan(from text: String) -> [String: [String]] {
-        // Heuristic: Each line mentioning a folder and file types
-        // e.g. "Create an 'Images' folder and move all PNG, JPG..."
-        // Regex for folder name and file types/extensions
-        var result: [String: [String]] = [:]
-        let lines = text.split(separator: "\n").map(String.init)
-        let folderPattern = try! NSRegularExpression(pattern: "(?:create|Create|add|Add)[^']*'([^']+)' folder.*?(move|Move)?[\\w\\s]*((?:\\*\\.[a-zA-Z0-9]+|\\.[a-zA-Z0-9]+|[A-Z]+ files?)(?:,? ?[A-Z]+ files?)*)", options: [])
-        for line in lines {
-            let nsline = line as NSString
-            let matches = folderPattern.matches(in: line, options: [], range: NSRange(location: 0, length: nsline.length))
-            for match in matches {
-                if match.numberOfRanges >= 3 {
-                    let folderName = nsline.substring(with: match.range(at: 1))
-                    let filePart = match.range(at: 3).location != NSNotFound ? nsline.substring(with: match.range(at: 3)) : ""
-                    // Extract extensions like ".jpg", "*.md", or upper-case file types
-                    let extPattern = try! NSRegularExpression(pattern: "\\.\\w+|\\*\\.\\w+|[A-Z]{2,4}", options: [])
-                    let extMatches = extPattern.matches(in: filePart, options: [], range: NSRange(location: 0, length: (filePart as NSString).length))
-                    let exts = extMatches.map { (filePart as NSString).substring(with: $0.range) }
-                    if !folderName.isEmpty && !exts.isEmpty {
-                        result[folderName] = exts
-                    }
-                }
-            }
-        }
-        return result
-    }
-    
-    func pacedMoveFiles(plan: [String: [String]], in rootURL: URL) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let fileManager = FileManager.default
-            var movedCount = 0
-            var errorCount = 0
-            var createdFolders = Set<String>()
-            do {
-                let files = try fileManager.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
-                for (folder, patterns) in plan {
-                    let folderURL = rootURL.appendingPathComponent(folder)
-                    if !fileManager.fileExists(atPath: folderURL.path) {
-                        try? fileManager.createDirectory(at: folderURL, withIntermediateDirectories: false)
-                        createdFolders.insert(folder)
-                        DispatchQueue.main.async {
-                            self.moveProgress = "Created folder: \(folder)"
-                        }
-                        Thread.sleep(forTimeInterval: 0.3)
-                    }
-                    for fileURL in files {
-                        let fileName = fileURL.lastPathComponent
-                        let ext = fileURL.pathExtension.uppercased()
-                        let matches = patterns.contains { pat in
-                            if pat.hasPrefix(".*") { return fileName.lowercased().hasSuffix(pat.dropFirst(2).lowercased()) }
-                            if pat.hasPrefix(".") { return "." + ext.lowercased() == pat.lowercased() }
-                            return ext == pat.uppercased() || fileName.uppercased().contains(pat.uppercased())
-                        }
-                        guard matches else { continue }
-                        let destURL = folderURL.appendingPathComponent(fileName)
-                        do {
-                            try fileManager.moveItem(at: fileURL, to: destURL)
-                            movedCount += 1
-                            DispatchQueue.main.async {
-                                self.moveProgress = "Moved \(fileName) to \(folder)/"
-                            }
-                        } catch {
-                            errorCount += 1
-                        }
-                        Thread.sleep(forTimeInterval: 0.3)
-                    }
-                }
-                DispatchQueue.main.async {
-                    self.moveProgress = "Completed: \(movedCount) files moved to \(createdFolders.count) folders, \(errorCount) errors."
-                    self.statusMessage = "Organization complete! Moved \(movedCount) file(s)."
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.moveProgress = "Scan error: \(error.localizedDescription)"
-                    self.statusMessage = "Failed to scan folder."
-                }
-            }
-        }
+
+    /// Stateless helper; each call spins a fresh session.
+    func respond(to prompt: String) async throws -> String {
+        self.transcript.append(.user(prompt))
+        let session = LanguageModelSession()
+        let response = try await session.respond(to: prompt, options: generationOptions)
+        self.transcript.append(.assistant(response.content))
+        return response.content
     }
 }
 
+// MARK: - Main View --------------------------------------------------------
 
-// MARK: - ContentView
-
+@available(macOS 26.0, *)
 struct ContentView: View {
-    @StateObject private var llm = {
-        if #available(macOS 26.0, *) {
-            return LLMViewModel()
-        } else {
-            fatalError("Foundation Models requires macOS 26 or later.")
-        }
-    }()
-    
-    @State private var promptText = ""
-    @State private var aiPlanText: String = ""
-    @State private var rootFileNode: FileNode? = nil // holds the scanned folder tree
-    @State private var moveProgress: String? = nil
-    
+    //   UI
+    @StateObject private var llm = LLMViewModel()
+    @State private var rootURL: URL?
+    @State private var history: [HistoryEntry] = []
+    @State private var rootFileNode: FileNode? = nil // will store the scanned folder tree
+
+    // Janitor background task
+    @State private var periodicTask: Task<Void, Never>? = nil
+    private let cleanupInterval: Duration = .seconds(180)
+
+    // ---------------------------------------------------------------------
+
     var body: some View {
         VStack(spacing: 20) {
-            
-            // ---------- LLM demo ----------
-            GroupBox("LLM API Test") {
+
+            // ─── Folder Picker ────────────────────────────────────────────
+            GroupBox("Folder to sort") {
                 VStack(spacing: 12) {
-                    TextField("Enter prompt…", text: $promptText)
-                        .textFieldStyle(.roundedBorder)
-                    
-                    Button("Send") {
-                        llm.send(promptText)
-                    }
-                    .disabled(promptText.isEmpty)
-                    
-                    if llm.isBusy { ProgressView() }
-                    
-                    if !llm.response.isEmpty {
-                        Text(llm.response)
-                            .padding()
-                            .background(Color.gray.opacity(0.1))
-                            .cornerRadius(6)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    
-                    if let err = llm.errorMessage {
-                        Text(err).foregroundColor(.red)
-                    }
-                }
-            }
-            
-            Divider()
-            
-            // ---------- Folder scan ----------
-            GroupBox("Select a folder to scan") {
-                VStack(spacing: 8) {
-                    Button("Choose Folder…", action: openFolderDialog)
-                    
-                    Button("Sort Files with AI") {
+                    Button("Choose Folder…",   action: chooseFolder)
+                    Button("Organize Files by Type") {
                         sortFiles()
                     }
-                    .disabled(rootFileNode == nil)
-                    
-                    Text(llm.statusMessage ?? "No folder selected.")
-                        .foregroundColor(.secondary)
-                        .italic()
-                    
-                    if let progress = moveProgress ?? llm.moveProgress {
-                        Text(progress).foregroundColor(.blue).font(.callout)
+                    .disabled(rootFileNode == nil || llm.isBusy)
+                    Button("Start Organization") {
+                        guard let url = rootURL else { return }
+                        Task { await startOrganization(at: url) }
                     }
-                    
-                    if !aiPlanText.isEmpty {
-                        Text("AI Plan:")
-                            .font(.subheadline).bold()
+                    .disabled(rootURL == nil || llm.isBusy)
+
+                    if let info = llm.statusMessage {
+                        Text(info).italic().foregroundColor(.secondary)
+                    }
+                    if llm.isBusy { ProgressView() }
+                }
+            }
+
+            // ─── History Log ─────────────────────────────────────────────
+            if !history.isEmpty {
+                Divider()
+                GroupBox("History") {
+                    ScrollViewReader { proxy in
                         ScrollView {
-                            Text(aiPlanText)
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal)
+                            VStack(alignment: .leading, spacing: 4) {
+                                ForEach(history) { entry in
+                                    Text(entry.timestamp.formatted(date: .omitted,
+                                                                   time: .standard)
+                                         + " — " + entry.message)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                        .id(entry.id)
+                                }
+                            }
                         }
-                        .frame(maxHeight: 200)
-                        .background(Color(NSColor.windowBackgroundColor).opacity(0.2))
-                        .cornerRadius(8)
+                        .onChange(of: history.count) { _ in
+                            proxy.scrollTo(history.last?.id, anchor: .bottom)
+                        }
                     }
+                    .frame(maxHeight: 240)
                 }
             }
         }
         .padding()
-        .frame(minWidth: 500, minHeight: 600)
-        .onChange(of: llm.moveProgress) { _, newValue in
-            moveProgress = newValue
-        }
+        .frame(minWidth: 540, minHeight: 500)
     }
 }
 
-// MARK: - Folder scan helpers
-extension ContentView {
-    
-    func scanFolder(at url: URL) {
-        let fileManager = FileManager.default
-        let resourceKeys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
-        
-        let rootNode = FileNode(name: url.lastPathComponent,
-                                url: url,
-                                isDirectory: true,
-                                size: nil,
-                                modifiedDate: nil)
-        var nodeStack: [FileNode] = [rootNode]
-        
-        if let enumerator = fileManager.enumerator(at: url,
-                                                   includingPropertiesForKeys: resourceKeys,
-                                                   options: [.skipsHiddenFiles]) {
-            for case let fileURL as URL in enumerator {
-                do {
-                    let values = try fileURL.resourceValues(forKeys: Set(resourceKeys))
-                    let depth = enumerator.level
-                    
-                    let node = FileNode(name: fileURL.lastPathComponent,
-                                        url: fileURL,
-                                        isDirectory: values.isDirectory ?? false,
-                                        size: values.fileSize,
-                                        modifiedDate: values.contentModificationDate)
-                    
-                    if depth < nodeStack.count - 1 {
-                        nodeStack.removeLast(nodeStack.count - 1 - depth)
+// MARK: - UI Helpers -------------------------------------------------------
+
+@available(macOS 26.0, *)
+private extension ContentView {
+
+    func log(_ msg: String) {
+        history.append(.init(message: msg))
+        llm.statusMessage = msg
+        print(msg)                       // dev console
+    }
+
+    func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.directoryURL = rootURL ?? FileManager.default.homeDirectoryForCurrentUser
+        if panel.runModal() == .OK, let url = panel.url {
+            rootURL = url
+            UserDefaults.standard.url(forKey: "LastRootURL")
+            log("Selected folder: \(url.path)")
+            
+            Task {
+                // Compose tool property info string for prompt context
+                var toolInfo = """
+                This tool organizes files by sorting and renaming folders based on file extensions and folder semantics.
+                """
+                // TODO: Append tool description, includesSchemaInInstructions, parameters strings if available here.
+
+                // Append transcript of prior LLM interactions if available here.
+                let transcriptText = (llm.transcript.history.map { $0.text }).joined(separator: "\n")
+                let promptContext = toolInfo + "\nPrevious conversation:\n" + transcriptText
+                
+                if let tree = await scanFolderWithLLM(at: url, promptContext: promptContext) {
+                    await MainActor.run {
+                        self.rootFileNode = tree
+                        let maxTokensOrChars: Int
+                        if let vm = self.llm as? LLMViewModel {
+                            maxTokensOrChars = (vm.generationOptions.maximumResponseTokens ?? 4096) / 5
+                        } else {
+                            maxTokensOrChars = 4096 / 5
+                        }
+                        let batches = buildFileTreeSummary(from: tree, maxTokensOrChars: maxTokensOrChars)
+                        for (i, batch) in batches.enumerated() {
+                            log("Folder tree batch \(i + 1)/\(batches.count):\n" + batch)
+                        }
                     }
-                    nodeStack.last?.children.append(node)
-                    if node.isDirectory { nodeStack.append(node) }
-                    
-                    let indent = String(repeating: "  ", count: depth)
-                    let icon = node.isDirectory ? "📁" : "📄"
-                    let sizeInfo = node.size.map { " - \($0) bytes" } ?? ""
-                    print("\(indent)\(icon) \(node.name)\(sizeInfo)")
-                } catch {
-                    print("Error reading \(fileURL.path): \(error)")
+                } else {
+                    // fallback to original scan
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        let tree = scanFolder(at: url)
+                        DispatchQueue.main.async {
+                            self.rootFileNode = tree
+                            let maxTokensOrChars: Int
+                            if let vm = self.llm as? LLMViewModel {
+                                maxTokensOrChars = (vm.generationOptions.maximumResponseTokens ?? 4096) / 5
+                            } else {
+                                maxTokensOrChars = 4096 / 5
+                            }
+                            let batches = buildFileTreeSummary(from: tree, maxTokensOrChars: maxTokensOrChars)
+                            for (i, batch) in batches.enumerated() {
+                                log("Folder tree batch \(i + 1)/\(batches.count):\n" + batch)
+                            }
+                        }
+                    }
                 }
             }
-            
-            print("Completed scanning \(rootNode.name). Found \(rootNode.children.count) items at top level.")
-            self.rootFileNode = rootNode   // retain the file tree for later use
         }
     }
     
-    func openFolderDialog() {
-        let panel = NSOpenPanel()
-        panel.title = "Choose Folder"
-        panel.prompt = "Select"
-        // Disable multiple selection to reduce system warnings
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
+    func scanFolder(at url: URL) -> FileNode {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else {
+            return FileNode(name: url.lastPathComponent, isDirectory: false)
+        }
+        if !isDir.boolValue {
+            return FileNode(name: url.lastPathComponent, isDirectory: false)
+        }
+        // Directory - recurse children
+        let childrenURLs = (try? fm.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+        var childrenNodes: [FileNode] = []
+        for childURL in childrenURLs {
+            let childNode = scanFolder(at: childURL)
+            childrenNodes.append(childNode)
+        }
+        return FileNode(name: url.lastPathComponent, isDirectory: true, children: childrenNodes)
+    }
+
+    /// An LLM-powered directory scanner that summarizes directory contents and attempts to interpret its structure using AI.
+    /// Falls back to scanFolder(at:) if unable to parse a valid structure.
+    func scanFolderWithLLM(at url: URL, promptContext: String? = nil) async -> FileNode? {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
+            return FileNode(name: url.lastPathComponent, isDirectory: false)
+        }
         
-        if panel.runModal() == .OK {
-            Task { @MainActor in
-                let urls = panel.urls
-                llm.statusMessage = urls.isEmpty
-                    ? "Selection cancelled."
-                    : "Selected a folder."
+        // Gather directory contents summary
+        let childrenURLs = (try? fm.contentsOfDirectory(at: url,
+                                                       includingPropertiesForKeys: [.isDirectoryKey],
+                                                       options: [.skipsHiddenFiles])) ?? []
+        
+        // Build summary string for prompt
+        var summaryLines: [String] = []
+        for child in childrenURLs {
+            let isDir = (try? child.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            if isDir {
+                summaryLines.append("\(child.lastPathComponent)/")
+            } else {
+                summaryLines.append(child.lastPathComponent)
             }
-            panel.urls.forEach(scanFolder(at:))
+        }
+        let summary = summaryLines.joined(separator: "\n")
+
+        // Compose prompt for LLM
+        var prompt = ""
+        if let context = promptContext {
+            prompt += context + "\n\n"
+        }
+        prompt += """
+        You are analyzing the folder structure of: \(url.lastPathComponent)
+        The contents are:
+        \(summary)
+
+        Please provide a JSON representation of this folder as a nested structure:
+        {
+            "name": "folderName",
+            "isDirectory": true,
+            "children": [
+                {"name": "childName", "isDirectory": bool, "children": [...]}
+            ]
+        }
+        Only output valid JSON.
+        """
+
+        do {
+            let session = LanguageModelSession()
+            let response = try await session.respond(to: prompt, options: GenerationOptions())
+            let data = Data(response.content.utf8)
+
+            // Decode JSON to FileNode-like structure
+            struct RawNode: Decodable {
+                let name: String
+                let isDirectory: Bool
+                let children: [RawNode]?
+            }
+
+            let rawNode = try JSONDecoder().decode(RawNode.self, from: data)
+
+            func convert(_ raw: RawNode) -> FileNode {
+                FileNode(name: raw.name, isDirectory: raw.isDirectory, children: raw.children?.map(convert) ?? [])
+            }
+            return convert(rawNode)
+
+        } catch {
+            // Fallback to manual scan on error
+            await MainActor.run {
+                log("⚠️ LLM scan error: \(error.localizedDescription), falling back to local scan.")
+            }
+            return scanFolder(at: url)
         }
     }
     
     func sortFiles() {
-        guard let root = rootFileNode else { return }
-        let instructionText = """
-Organize the files in the provided folder structure in a clear, logical way, grouping similar files into appropriately-named folders (e.g., any file). Only create new folders if they help with organization. For each folder, move files of matching type or category into it, and do not move files unnecessarily. Respond ONLY with a valid JSON array of actions, each in this format:
-[
-  {"action": "create_folder", "name": "<folder_name_that_describes_contents>"},
-  {"action": "move_file", "source": "<file>.<type>", "destination": "<folder_name_that_describes_contents>/<file>.<type>"}
-]
-No explanation, no extra text, no markdown.
-"""
-        let fileTreeSummary = buildFileTreeSummary(from: root)
-        let promptText = "Folder structure:\n\(fileTreeSummary)"
-        aiPlanText = "" // clear from previous
-        llm.statusMessage = "Analyzing folder..."
-        Task {
-            do {
-                let actions = try await llm.session.respond(
-                    to: instructionText + "\n" + promptText,
-                    options: llm.generationOptions
-                )
-                let content = actions.content
-                print("Raw AI output: \(actions.content)")
-                guard let data = content.data(using: .utf8) else {
-                    DispatchQueue.main.async {
-                        llm.statusMessage = "AI did not return valid UTF-8 JSON."
-                    }
-                    return
-                }
-                let decoder = JSONDecoder()
-                let decodedActions = try decoder.decode([FileSortAction].self, from: data)
-                let planDescription = decodedActions.map {
-                    var desc = "Action: \($0.action)"
-                    if let name = $0.name { desc += ", Name: \(name)" }
-                    if let source = $0.source { desc += ", Source: \(source)" }
-                    if let dest = $0.destination { desc += ", Destination: \(dest)" }
-                    return desc
-                }.joined(separator: "\n")
-                DispatchQueue.main.async {
-                    aiPlanText = planDescription
-                }
-                if let rootURL = rootFileNode?.url {
-                    executeSortingPlan(decodedActions, rootURL: rootURL)
-                }
-            } catch {
-                print("AI generation or decoding failed: \(error)")
-                DispatchQueue.main.async {
-                    llm.statusMessage = "AI failed to generate a valid JSON plan: \(error.localizedDescription)"
-                }
-            }
-        }
+        // Will implement AI sorting here in the next steps
+        print("Sorting files by type...")
     }
-    
-    // Execute the sorting plan
-    func executeSortingPlan(_ plan: [FileSortAction], rootURL: URL) {
-        let fileManager = FileManager.default
-        var createdFolders = Set<String>()
-        var movedCount = 0
-        var errorCount = 0
-        
-        for action in plan {
-            switch action.action {
-            case "create_folder":
-                if let folderName = action.name {
-                    let folderURL = rootURL.appendingPathComponent(folderName)
-                    if !fileManager.fileExists(atPath: folderURL.path) {
-                        do {
-                            try fileManager.createDirectory(at: folderURL,
-                                                          withIntermediateDirectories: true)
-                            createdFolders.insert(folderName)
-                            print("Created folder: \(folderName)")
-                        } catch {
-                            print("Failed to create folder \(folderName): \(error)")
-                            errorCount += 1
-                        }
-                    }
+}
+// ==========================================================================
+// MARK: - Organization Pipeline
+// ==========================================================================
+
+@available(macOS 26.0, *)
+private extension ContentView {
+
+    // Entry point ----------------------------------------------------------
+
+    func startOrganization(at root: URL) async {
+        guard periodicTask == nil else { return }      // prevent re‑entry
+        llm.isBusy = true
+        log("▶︎ Phase 1: Iterative sort")
+
+        // (1) Spawn janitor
+        periodicTask = Task.detached(priority: .background) { [root, cleanupInterval] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: cleanupInterval)
+                Task {
+                    await runJanitor(on: root)
                 }
-            
-            case "move_file":
-                if let source = action.source,
-                   let destination = action.destination {
-                    let sourceURL = rootURL.appendingPathComponent(source)
-                    let destURL = rootURL.appendingPathComponent(destination)
-                    
-                    // Ensure destination directory exists
-                    let destDir = destURL.deletingLastPathComponent()
-                    try? fileManager.createDirectory(at: destDir,
-                                                   withIntermediateDirectories: true)
-                    
-                    do {
-                        try fileManager.moveItem(at: sourceURL, to: destURL)
-                        movedCount += 1
-                        print("Moved: \(source) → \(destination)")
-                    } catch {
-                        print("Failed to move \(source): \(error)")
-                        errorCount += 1
-                    }
-                }
-            
-            default:
-                print("Unknown action: \(action.action)")
             }
         }
-        
-        // Update status
-        var status = "Organization complete! "
-        if movedCount > 0 {
-            status += "Moved \(movedCount) file\(movedCount == 1 ? "" : "s"). "
-        }
-        if createdFolders.count > 0 {
-            status += "Created \(createdFolders.count) folder\(createdFolders.count == 1 ? "" : "s"). "
-        }
-        if errorCount > 0 {
-            status += "\(errorCount) error\(errorCount == 1 ? "" : "s") occurred."
-        }
-        
-        llm.statusMessage = status
-        
-        while let fileURL = enumerator?.nextObject() as? URL {
-            let parentURL = fileURL.deletingLastPathComponent()
-            guard let parentNode = nodeLookup[parentURL] else { continue }
-            let isDir = (try? fileURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-            let node = FileNode(name: fileURL.lastPathComponent, url: fileURL, isDirectory: isDir, parent: parentNode)
-            parentNode.children.append(node)
-            if isDir { nodeLookup[fileURL] = node }
-        }
-        return rootNode
+
+        // (2) Main two‑phase algorithm
+        await organizeDirectory(root)
+        log("✓ Phase 1 complete")
+
+        log("▶︎ Phase 2: Zettelkasten refinement")
+        await zettelkastenRefine(root)
+        log("✓ Phase 2 complete")
+
+        // (3) Clean up
+        periodicTask?.cancel()
+        periodicTask = nil
+        llm.isBusy = false
+        log("✔︎ Done!")
     }
 
-    private func getDirectoriesBottomUp(from root: FileNode) -> [FileNode] {
-        var directories: [FileNode] = []
-        func traverse(_ node: FileNode) {
-            guard node.isDirectory else { return }
-            node.children.forEach { traverse($0) }
-            directories.append(node)
+    // ---------------------------------------------------------------------
+    // Phase 1 – Recursive file moves + evaluation
+    // ---------------------------------------------------------------------
+
+    func organizeDirectory(_ dir: URL) async {
+        // Recurse into a snapshot of current sub‑directories
+        let initialSubs = subdirectories(of: dir)
+        for sub in initialSubs { await organizeDirectory(sub) }
+
+        // Loop passes until no loose files remain
+        var pass = 0
+        while true {
+            pass += 1
+            let loose = looseFiles(in: dir)
+            guard !loose.isEmpty else { break }
+            log("Pass \(pass) in \(dir.lastPathComponent) (\(loose.count) files)")
+            for file in loose { await processFile(file, in: dir) }
+            await evaluateDirectory(dir)
+            if pass >= 10 { log("❗️Safety break in \(dir.lastPathComponent)"); break }
         }
-        traverse(root)
-        return directories
+
+        // Example usage of new helpers (not active in pipeline yet):
+        // let planText = "<plan text from LLM here>"
+        // let extToFolder = parsePlan(plan: planText, fileList: looseFiles(in: dir))
+        // await performPacedMoves(extToFolder: extToFolder, files: looseFiles(in: dir), in: dir)
     }
-    
-    private func buildTreeSummary(from node: FileNode, level: Int = 0) -> String {
-        var result = String(repeating: "  ", count: level) + node.name + "/\n"
-        for child in node.children {
-            if child.isDirectory {
-                result += buildTreeSummary(from: child, level: level + 1)
-            } else {
-                result += String(repeating: "  ", count: level + 1) + child.name + "\n"
+
+    func looseFiles(in dir: URL) -> [URL] {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(at: dir,
+                                                      includingPropertiesForKeys: [.isDirectoryKey],
+                                                      options: [.skipsHiddenFiles]) else { return [] }
+        return items.filter { !( (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? true) }
+    }
+
+    func subdirectories(of dir: URL) -> [URL] {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(at: dir,
+                                                      includingPropertiesForKeys: [.isDirectoryKey],
+                                                      options: [.skipsHiddenFiles]) else { return [] }
+        return items.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+    }
+
+
+    // --- single file prompt ---------------------------------------------
+
+    func processFile(_ file: URL, in dir: URL) async {
+        let name = file.lastPathComponent
+        let prompt = """
+        You are a file organization assistant. A file named "\(name)" is in folder "\(dir.lastPathComponent)".
+        
+        Based on the file extension and name, suggest an appropriate folder to organize it into.
+        
+        You must respond with ONLY a valid JSON array in this exact format:
+        [{"action":"move_file","source":"\(name)","destination":"<FolderName>/\(name)","name":null}]
+        
+        Do not include any other text, explanations, or formatting. Only return the JSON array.
+        
+        Example response:
+        [{"action":"move_file","source":"document.pdf","destination":"Documents/document.pdf","name":null}]
+        """
+        var retryCount = 0
+        let maxRetries = 2
+        
+        while retryCount <= maxRetries {
+            do {
+                let raw = try await llm.respond(to: prompt)
+                try executePlan(raw, in: dir, expectedFile: name)
+                break // Success, exit retry loop
+            } catch { 
+                retryCount += 1
+                log("⚠️ AI error (attempt \(retryCount)): \(error.localizedDescription)")
+                
+                if retryCount <= maxRetries {
+                    log("🕐 Waiting 2 seconds before retry...")
+                    try? await Task.sleep(for: .seconds(2))
+                } else {
+                    log("❌ Max retries reached for \(name)")
+                }
             }
         }
-        await moveFiles(in: root)
-        // All moves done – update status on main thread
-        DispatchQueue.main.async {
-            self.llm.statusMessage = "Files organized by type successfully!"
+    }
+
+    // --- evaluation prompt ----------------------------------------------
+
+    func evaluateDirectory(_ dir: URL) async {
+        let subs = subdirectories(of: dir)
+        guard subs.count > 1 else { return }
+        let names = subs.map(\.lastPathComponent).joined(separator: ", ")
+        let prompt = """
+        You are a file organization assistant. Folder "\(dir.lastPathComponent)" contains these subfolders: [\(names)].
+        
+        Analyze if any folders should be renamed for better organization. If no changes are needed, return an empty array.
+        
+        You must respond with ONLY a valid JSON array in this exact format:
+        [{"action":"rename_folder","source":"OldName","destination":null,"name":"NewName"}]
+        
+        Or if no changes needed:
+        []
+        
+        Do not include any other text, explanations, or formatting. Only return the JSON array.
+        """
+        do {
+            let raw = try await llm.respond(to: prompt)
+            try executePlan(raw, in: dir, expectedFile: nil)
+        } catch { log("⚠️ Eval error: \(error.localizedDescription)") }
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 2 – Zettelkasten refinement
+    // ---------------------------------------------------------------------
+
+    func zettelkastenRefine(_ dir: URL) async {
+        let subs = subdirectories(of: dir)
+        for sub in subs { await zettelkastenRefine(sub) }      // post‑order
+
+        guard !subs.isEmpty else { return }
+        let names = subs.map(\.lastPathComponent).joined(separator: ", ")
+        let prompt = """
+        You are a file organization assistant. Parent folder "\(dir.lastPathComponent)" contains: [\(names)].
+        
+        Analyze if folders should be renamed or consolidated for better semantic organization. If no changes are needed, return an empty array.
+        
+        You must respond with ONLY a valid JSON array in this exact format:
+        [{"action":"rename_folder","source":"OldName","destination":null,"name":"NewName"}]
+        
+        Or if no changes needed:
+        []
+        
+        Do not include any other text, explanations, or formatting. Only return the JSON array.
+        """
+        do {
+            let raw = try await llm.respond(to: prompt)
+            try executePlan(raw, in: dir, expectedFile: nil)
+        } catch { log("⚠️ Zettel error: \(error.localizedDescription)") }
+    }
+
+    // ---------------------------------------------------------------------
+    // Janitor – periodic bottom clean‑up
+    // ---------------------------------------------------------------------
+
+    func runJanitor(on root: URL) async {
+        let leaves = leafDirectories(from: root)
+        guard !leaves.isEmpty else { return }
+        log("🧹 Janitor pass (\(leaves.count) leaf dir[s])")
+        for leaf in leaves { await organizeDirectory(leaf) }
+    }
+
+    func leafDirectories(from root: URL) -> [URL] {
+        var leaves: [URL] = []
+        let fm = FileManager.default
+        guard let en = fm.enumerator(at: root,
+                                     includingPropertiesForKeys: [.isDirectoryKey],
+                                     options: [.skipsHiddenFiles, .skipsPackageDescendants])
+        else { return [] }
+
+        for case let url as URL in en {
+            if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
+               subdirectories(of: url).isEmpty {
+                leaves.append(url)
+            }
+        }
+        return leaves.isEmpty ? [root] : leaves
+    }
+
+    // ---------------------------------------------------------------------
+    // New Helpers: parsePlan and performPacedMoves
+    // ---------------------------------------------------------------------
+
+    /**
+     Parses an LLM-generated plan text to produce a mapping from file extensions to destination folder names.
+     
+     The plan text may be in semi-structured, human-friendly formats such as markdown lists, bullet points, or plain text, possibly containing folder names in bold (`**Folder**`), quoted ("Folder" or 'Folder'), or as the first word of a line. The function heuristically extracts folder names and associates them with the relevant file extensions or file names it finds mentioned in each line.
+
+     - The mapping is case-insensitive for extensions (lowercased, without dot).
+     - For each folder name found, extensions matching those present in `fileList` are mapped to the folder.
+     - Additionally, if a file name from `fileList` is mentioned in a line, that file's extension is mapped to the folder name from that line.
+
+     ## Example Input
+         1. **PDFs**: All `.pdf` files
+         2. "Images": jpg, png, jpeg
+         3. Documents – docx, txt, 'notes.txt'
+
+     - Parameters:
+        - plan: The plan as returned from the LLM, containing folder/extension groupings (in markdown, bullet, or similar text).
+        - fileList: The list of current files (as URLs) in the directory to be organized. Only extensions present in this list are mapped.
+     - Returns: A dictionary mapping file extensions (lowercased, dot-stripped) to the destination folder names extracted from the plan text.
+     - Note: Lines that do not mention any known extension or file name are ignored. The mapping is robust to mixed formats, but ambiguous or malformed lines may be skipped silently.
+     */
+    func parsePlan(plan: String, fileList: [URL]) -> [String: String] {
+        var mapping: [String: String] = [:]
+
+        let fileExtensions = Set(fileList.compactMap { ext in
+            let lowered = ext.pathExtension.lowercased()
+            return lowered.isEmpty ? nil : lowered
+        })
+
+        let lowercasedFileNames = Set(fileList.map { $0.lastPathComponent.lowercased() })
+
+        // Split the plan into lines
+        let lines = plan.components(separatedBy: .newlines)
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+
+            // Attempt to extract folder name from the line
+
+            // 1) Try markdown bold: **FolderName**
+            var folderName: String? = nil
+            if let boldStart = trimmed.range(of: "**"), let boldEnd = trimmed.range(of: "**", options: [], range: boldStart.upperBound..<trimmed.endIndex) {
+                folderName = String(trimmed[boldStart.upperBound..<boldEnd.lowerBound])
+            }
+
+            // 2) Else try quoted folder name: "FolderName" or 'FolderName'
+            if folderName == nil {
+                if let quoteStart = trimmed.firstIndex(where: { "\"'".contains($0) }),
+                   let quoteEnd = trimmed[trimmed.index(after: quoteStart)...].firstIndex(of: trimmed[quoteStart]) {
+                    folderName = String(trimmed[trimmed.index(after: quoteStart)..<quoteEnd])
+                }
+            }
+
+            // 3) Else fallback: pick first word after number or bullet (like after '1.' or '-')
+            if folderName == nil {
+                // Find first word after digit or bullet
+                let pattern = #"^[\s\d\.\-\*\+]*([A-Za-z0-9_\- ]+)"#
+                if let regex = try? NSRegularExpression(pattern: pattern, options: []),
+                   let match = regex.firstMatch(in: trimmed, options: [], range: NSRange(location: 0, length: trimmed.utf16.count)),
+                   match.numberOfRanges > 1,
+                   let range = Range(match.range(at: 1), in: trimmed) {
+                    folderName = String(trimmed[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+
+            guard let folder = folderName, !folder.isEmpty else {
+                continue
+            }
+
+            // Find extensions mentioned in the line
+            var foundExtensions: Set<String> = []
+
+            // Tokenize the line by non-alphanumeric chars to capture extensions as words
+            let tokens = trimmed.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted)
+            for token in tokens {
+                if fileExtensions.contains(token) {
+                    foundExtensions.insert(token)
+                }
+            }
+
+            // Map extensions to folder
+            for ext in foundExtensions {
+                mapping[ext] = folder
+            }
+
+            // Additionally try to map by file name:
+            // If any file name matches a substring in the line (case-insensitive), map that file's extension to folder
+            for fileURL in fileList {
+                let fileNameLower = fileURL.lastPathComponent.lowercased()
+                if trimmed.lowercased().contains(fileNameLower) {
+                    let ext = fileURL.pathExtension.lowercased()
+                    if !ext.isEmpty {
+                        mapping[ext] = folder
+                    }
+                }
+            }
+        }
+        return mapping
+    }
+
+    /// Moves files into folders as specified by the extension-to-folder mapping, with a 500ms pause between moves.
+    /// - Parameters:
+    ///   - extToFolder: Dictionary mapping file extension to folder name.
+    ///   - files: Array of file URLs to move.
+    ///   - dir: Root directory URL where the files and folders reside.
+    func performPacedMoves(extToFolder: [String: String], files: [URL], in dir: URL) async {
+        let fm = FileManager.default
+
+        for file in files {
+            let ext = file.pathExtension.lowercased()
+            if let folderName = extToFolder[ext] {
+                let destFolder = dir.appendingPathComponent(folderName, isDirectory: true)
+                let destURL = destFolder.appendingPathComponent(file.lastPathComponent)
+
+                do {
+                    try fm.createDirectory(at: destFolder, withIntermediateDirectories: true)
+                    if fm.fileExists(atPath: destURL.path) {
+                        try fm.removeItem(at: destURL)  // overwrite if exists
+                    }
+                    try fm.moveItem(at: file, to: destURL)
+                    await MainActor.run {
+                        log("Moved «\(file.lastPathComponent)» → \(folderName)")
+                    }
+                    try await Task.sleep(for: .milliseconds(500))
+                } catch {
+                    await MainActor.run {
+                        log("⚠️ Move error: \(error.localizedDescription) for file \(file.lastPathComponent)")
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Plan execution -------------------------------------------------------
+
+    func executePlan(_ raw: String, in dir: URL, expectedFile: String?) throws {
+        // Log the raw response for debugging
+        log("🔍 AI Response: \(raw.prefix(100))...")
+        
+        guard let start = raw.firstIndex(of: "["), let end = raw.lastIndex(of: "]") else {
+            log("⚠️ Plan rejected: no JSON array found in response")
+            return
+        }
+        let json = raw[start...end]
+        let data = Data(String(json).utf8)
+
+        let actions = try JSONDecoder().decode([FileSortAction].self, from: data)
+        let fm = FileManager.default
+
+        for act in actions {
+            switch act.action {
+
+            case .move_file:
+                guard expectedFile == nil || act.source == expectedFile else { continue }
+                guard let dest = act.destination else { continue }
+                let srcURL = dir.appendingPathComponent(act.source)
+                let dstURL = dir.appendingPathComponent(dest)
+
+                do {
+                    try fm.createDirectory(at: dstURL.deletingLastPathComponent(),
+                                           withIntermediateDirectories: true)
+                } catch {
+                    // Directory might already exist, that's ok
+                }
+                try? fm.removeItem(at: dstURL)            // overwrite if exists
+                do {
+                    try fm.moveItem(at: srcURL, to: dstURL)
+                    log("Moved «\(act.source)» → \(dstURL.lastPathComponent)")
+                } catch {
+                    log("⚠️ Move failed: \(error.localizedDescription) for \(act.source)")
+                }
+
+            case .rename_folder:
+                guard let newName = act.name else { continue }
+                let srcURL = dir.appendingPathComponent(act.source)
+                let dstURL = dir.appendingPathComponent(newName)
+                try? fm.removeItem(at: dstURL)
+                try fm.moveItem(at: srcURL, to: dstURL)
+                log("Renamed «\(act.source)» → «\(newName)»")
+
+            case .create_folder:
+                let newURL = dir.appendingPathComponent(act.source)
+                try fm.createDirectory(at: newURL, withIntermediateDirectories: true)
+                log("Created folder «\(act.source)»")
+            }
         }
     }
 }
+// ==========================================================================
+#if DEBUG
+@available(macOS 13.0, *)
+#Preview {
+    if #available(macOS 26.0, *) {
+        ContentView()
+    } else {
+        Text("Requires macOS 26.0")
+    }
+}
+#endif
 
